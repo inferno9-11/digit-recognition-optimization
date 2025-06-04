@@ -1,0 +1,268 @@
+# Install dependencies
+!pip install torch
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import pandas as pd
+import time
+
+# Device configuration
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# 1. Define Models
+class LightCNN(nn.Module):
+    def __init__(self):
+        super(LightCNN, self).__init__()
+        self.conv1 = nn.Conv2d(1, 16, 3, 1)
+        self.fc1 = nn.Linear(26*26*16, 10)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = x.view(x.size(0), -1)
+        x = self.fc1(x)
+        return x
+
+class ComplexCNN(nn.Module):
+    def __init__(self):
+        super(ComplexCNN, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, 1)
+        self.conv2 = nn.Conv2d(32, 64, 3, 1)
+        self.fc1 = nn.Linear(24*24*64, 128)
+        self.fc2 = nn.Linear(128, 10)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+# 2. Load Dataset from CSV
+def load_mnist_from_csv(csv_path):
+    print(f"Loading dataset from {csv_path}...")
+    df = pd.read_csv(csv_path)
+    labels = df.iloc[:, 0].values
+    images = df.iloc[:, 1:].values.reshape(-1, 1, 28, 28).astype('float32') / 255.0
+    images = torch.tensor(images)
+    labels = torch.tensor(labels)
+    print(f"Loaded {len(labels)} samples")
+    return images, labels
+
+# 3. Generic Training Functions
+def train(model, optimizer, criterion, loader, epochs=5):
+    model.train()
+    for epoch in range(epochs):
+        start_time = time.time()
+        running_loss = 0.0
+        for i, (data, target) in enumerate(loader):
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+            
+            if i % 100 == 99:
+                print(f'Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(loader)}], Loss: {running_loss/100:.4f}')
+                running_loss = 0.0
+        
+        epoch_time = time.time() - start_time
+        print(f"Epoch {epoch+1} completed in {epoch_time:.2f} seconds")
+
+def evaluate(model, loader):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data, target in loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            _, predicted = torch.max(output.data, 1)
+            total += target.size(0)
+            correct += (predicted == target).sum().item()
+    
+    accuracy = 100 * correct / total
+    print(f'Accuracy on {total} test images: {accuracy:.2f}%')
+    return accuracy
+
+# 4. Knowledge Distillation Function
+def distillation_loss(student_outputs, teacher_outputs, targets, T=2.0, alpha=0.7):
+    KD_loss = nn.KLDivLoss(reduction='batchmean')(
+        F.log_softmax(student_outputs / T, dim=1),
+        F.softmax(teacher_outputs / T, dim=1)
+    ) * (T * T) * alpha + F.cross_entropy(student_outputs, targets) * (1. - alpha)
+    return KD_loss
+
+def train_student(student, teacher, optimizer, loader, epochs=5):
+    student.train()
+    teacher.eval()
+    
+    for epoch in range(epochs):
+        start_time = time.time()
+        running_loss = 0.0
+        
+        for i, (data, target) in enumerate(loader):
+            data, target = data.to(device), target.to(device)
+            
+            # Forward pass
+            with torch.no_grad():
+                teacher_outputs = teacher(data)
+            
+            optimizer.zero_grad()
+            student_outputs = student(data)
+            
+            # Knowledge distillation loss
+            loss = distillation_loss(student_outputs, teacher_outputs, target)
+            
+            # Backward and optimize
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item()
+            
+            if i % 100 == 99:
+                print(f'Student Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(loader)}], Loss: {running_loss/100:.4f}')
+                running_loss = 0.0
+        
+        epoch_time = time.time() - start_time
+        print(f"Student Epoch {epoch+1} completed in {epoch_time:.2f} seconds")
+
+# 5. Model Optimization Functions
+def prune_model(model, amount=0.3):
+    print(f"Pruning model with {amount*100}% threshold...")
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if 'weight' in name:
+                threshold = torch.quantile(param.abs(), amount)
+                mask = param.abs() >= threshold
+                param.mul_(mask)
+    return model
+
+# 6. Adaptive Inference
+def adaptive_inference(light_model, heavy_model, data, threshold=0.8):
+    light_model.eval()
+    heavy_model.eval()
+    
+    with torch.no_grad():
+        # Get predictions from light model
+        light_output = light_model(data.to(device))
+        light_prob = F.softmax(light_output, dim=1)
+        conf, light_pred = torch.max(light_prob, dim=1)
+        
+        # Use heavy model only for low confidence predictions
+        mask = conf <= threshold
+        if mask.sum() > 0:
+            # Only process uncertain samples with heavy model
+            uncertain_data = data[mask].to(device)
+            heavy_output = heavy_model(uncertain_data)
+            heavy_pred = torch.argmax(heavy_output, dim=1)
+            
+            # Combine predictions
+            final_pred = light_pred.clone()
+            final_pred[mask] = heavy_pred
+        else:
+            final_pred = light_pred
+            
+    return final_pred.cpu()
+
+def test_adaptive(light_model, heavy_model, loader, threshold=0.8):
+    correct = 0
+    total = 0
+    for data, target in loader:
+        pred = adaptive_inference(light_model, heavy_model, data, threshold)
+        correct += pred.eq(target).sum().item()
+        total += target.size(0)
+    
+    accuracy = 100 * correct / total
+    print(f'Adaptive Inference Accuracy: {accuracy:.2f}%')
+    return accuracy
+
+# MAIN EXECUTION
+def main():
+    # Load data
+    try:
+        train_images, train_labels = load_mnist_from_csv('mnist_train.csv')
+        test_images, test_labels = load_mnist_from_csv('mnist_test.csv')
+        
+        train_dataset = torch.utils.data.TensorDataset(train_images, train_labels)
+        test_dataset = torch.utils.data.TensorDataset(test_images, test_labels)
+        
+        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+        
+        print("Data loaded successfully!")
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return
+
+    # Part 1: Train Teacher Model
+    print("\n==== TEACHER MODEL TRAINING ====")
+    teacher = ComplexCNN().to(device)
+    teacher_optimizer = optim.Adam(teacher.parameters(), lr=0.001)
+    criterion = nn.CrossEntropyLoss()
+    
+    print("Training Teacher Model...")
+    train(teacher, teacher_optimizer, criterion, train_loader, epochs=5)
+    
+    # Save teacher model checkpoint
+    teacher_path = 'teacher_model.pth'
+    torch.save(teacher.state_dict(), teacher_path)
+    print(f"Teacher model saved to {teacher_path}")
+    
+    # Evaluate teacher
+    print("Evaluating Teacher Model...")
+    teacher_acc = evaluate(teacher, test_loader)
+    
+    # Part 2: Train Student Model with Knowledge Distillation
+    print("\n==== STUDENT MODEL TRAINING ====")
+    student = LightCNN().to(device)
+    student_optimizer = optim.Adam(student.parameters(), lr=0.001)
+    
+    print("Training Student Model with Knowledge Distillation...")
+    train_student(student, teacher, student_optimizer, train_loader, epochs=5)
+    
+    # Save student model checkpoint
+    student_path = 'student_model.pth'
+    torch.save(student.state_dict(), student_path)
+    print(f"Student model saved to {student_path}")
+    
+    # Evaluate student before optimization
+    print("Evaluating Student Model (before optimization)...")
+    student_acc = evaluate(student, test_loader)
+    
+    # Part 3: Optimize Student Model
+    print("\n==== STUDENT MODEL OPTIMIZATION ====")
+    
+    # Prune student model
+    print("Pruning Student Model...")
+    student = prune_model(student)
+    
+    # Evaluate after pruning
+    print("Evaluating Student Model (after pruning)...")
+    student_pruned_acc = evaluate(student, test_loader)
+    
+    # Part 4: Adaptive Inference
+    print("\n==== ADAPTIVE INFERENCE EVALUATION ====")
+    
+    print("Testing Adaptive Inference...")
+    adaptive_acc = test_adaptive(student, teacher, test_loader, threshold=0.8)
+    
+    # Summary
+    print("\n==== PERFORMANCE SUMMARY ====")
+    print(f"Teacher Model Accuracy: {teacher_acc:.2f}%")
+    print(f"Student Model Accuracy (original): {student_acc:.2f}%")
+    print(f"Student Model Accuracy (after pruning): {student_pruned_acc:.2f}%")
+    print(f"Adaptive Inference Accuracy: {adaptive_acc:.2f}%")
+    print("\nFinished full pipeline! 🚀")
+
+if __name__ == "__main__":
+    # Simple error handling
+    try:
+        main()
+    except Exception as e:
+        print(f"An error occurred: {e}")
